@@ -2,6 +2,7 @@ import math
 import torch
 import torchvision
 
+
 from torchvision.models import resnet18, ResNet18_Weights
 from torchvision.models.feature_extraction import create_feature_extractor
 from torchvision.ops.feature_pyramid_network import FeaturePyramidNetwork
@@ -18,6 +19,8 @@ from .transforms import GeneralizedRCNNTransform
 
 # loss functions
 from .losses import sigmoid_focal_loss, giou_loss
+
+INF = 100000000
 
 
 class FCOSClassificationHead(nn.Module):
@@ -329,6 +332,8 @@ class FCOS(nn.Module):
         points, strides, reg_range = self.point_generator(fpn_features)
         
         #num_points = [center.size(0) for center in points]
+        #print('num_points',num_points)
+        #print('num_images',cls_logits[0].size(0))
 
         # training / inference
         if self.training:
@@ -381,8 +386,367 @@ class FCOS(nn.Module):
     def compute_loss(
         self, targets, points, strides, reg_range, cls_logits, reg_outputs, ctr_logits
     ):
-        
+        all_level_points = []
+        #points ([],[],[])each WxHx2
+        for i in range (len(points)):
+            all_level_points.append(points[i].view(-1,2))
+
+        #print(points[0].shape,points[1].shape,points[2].shape)
+        #print(all_level_points[0].shape,all_level_points[1].shape,all_level_points[2].shape)
+        #all_level_points ([],[],[])each (W*H)x2
+
+        #labels, bbox_targets = self.get_targets(points,)
+
+        num_imgs = cls_logits[0].size(0)
+        labels, bbox_targets = self.get_targets(all_level_points, targets, strides, reg_range)
+
+        #print(len(bbox_targets),bbox_targets[0].shape,bbox_targets[1].shape,bbox_targets[2].shape)
+        #print(len(cls_logits))
+        #print(cls_logits[0].shape)
+
+        #make shape as [(h*w*n, 20)*3]
+        flatten_cls_scores = [
+            cls_score.permute(0, 2, 3, 1).reshape(-1, self.num_classes)
+            for cls_score in cls_logits
+        ]
+        #print(flatten_cls_scores[0].shape)
+        # make shape as flatten_bbox_preds = [(h*w*n, 4)*3]
+        #print(reg_outputs[1].shape)
+        flatten_bbox_preds = [
+            bbox_pred.permute(0, 2, 3, 1).reshape(-1, 4)
+            for bbox_pred in reg_outputs
+        ]
+        #print(len(flatten_bbox_preds),flatten_bbox_preds[1].shape)
+        #make shape as flatten_bbox_preds = [(h*w*n)*3]
+        #print(ctr_logits[2].shape)
+        flatten_centerness = [
+            centerness.permute(0, 2, 3, 1).reshape(-1)
+            for centerness in ctr_logits
+        ]
+        #print(len(flatten_centerness),flatten_centerness[2].shape)
+
+        # flatten_cls_scores = [sum(h*w*n) x 20] for all images
+        flatten_cls_scores = torch.cat(flatten_cls_scores)
+        #print(flatten_cls_scores.shape)
+        # flatten_bbox_preds = [sum(h*w*n) x 4]
+        flatten_bbox_preds = torch.cat(flatten_bbox_preds)
+        #print(flatten_bbox_preds.shape)
+        # flatten_centerness = [sum(h*w*n) x 1]
+        flatten_centerness = torch.cat(flatten_centerness)
+        #print(flatten_centerness.shape)
+        # flatten_labels = [sum(h*w*n) x 1]
+        #after映射
+        flatten_labels = torch.cat(labels)
+        #print(flatten_labels.shape)
+        # flatten_bbox_targets = [sum(h*w*n) x 4]
+        #after映射
+        flatten_bbox_targets = torch.cat(bbox_targets)
+        #print(flatten_bbox_targets.shape)
+        # flatten_points = [sum(h*w*n) x 2]
+        flatten_points = torch.cat(
+            [points.repeat(num_imgs, 1) for points in all_level_points])
+        #print(flatten_points.shape)
+
+        # the positive label's range
+        # positive label'range fg_class_ind: [0, num_classes -1], negative label'range bg_class_ind: num_classes
+        bg_class_ind = self.num_classes
+        #the inds of positive labels
+        #shape: (num_pos_anchors)
+        pos_inds = ((flatten_labels >= 0)
+            & (flatten_labels < bg_class_ind)).nonzero().reshape(-1)
+        #print(pos_inds.shape,pos_inds)
+
+        num_pos = len(pos_inds)
+        #print(num_pos)
+        #print(flatten_cls_scores)
+        if num_pos == 0:
+            num_pos = num_imgs
+        #print(flatten_labels)
+
+        #make the 
+        #f_cls_scores=torch.argmax(flatten_cls_scores,axis=1)
+        #print(f_cls_scores)
+
+        #for i in range(flatten_labels.shape[0]):
+         #   if flatten_labels[i] == 20:
+          #      flatten_labels[i] = 0
+           # else:
+            #    flatten_labels[i] = 1
+        #print(flatten_labels)
+        #device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+        #aa=torch.empty(flatten_cls_scores.shape[0],self.num_classes+1).to(device)
+        #cls_scores_onehot = torch.zeros_like(aa)
+        #print(cls_scores_onehot[0:4,:])
+        #cls_scores_onehot.scatter_(1,flatten_labels,1)
+        n_21 = self.num_classes + 1
+        flatten_labels_one_hot = torch.nn.functional.one_hot(flatten_labels % n_21)
+        #print(flatten_labels_one_hot[0:3,:],flatten_labels_one_hot.shape)
+        flatten_labels_one_hot = flatten_labels_one_hot[:,:-1]
+
+        #compute the loss for classification
+        loss_cls = sigmoid_focal_loss(
+            flatten_cls_scores, flatten_labels_one_hot,reduction="sum")/num_pos
+        #print(loss_cls)
+
+        pos_bbox_preds = flatten_bbox_preds[pos_inds]
+        pos_centerness = flatten_centerness[pos_inds]
+        pos_bbox_targets = flatten_bbox_targets[pos_inds]
+
+        pos_centerness_targets = self.centerness_target(pos_bbox_targets)
+        #print(pos_centerness)
+        #print(pos_centerness_targets)
+        #print(pos_bbox_preds)
+
+        if num_pos > 0:
+            #anchor points positive
+            pos_points = flatten_points[pos_inds]
+            # STEP 13: 得到预测的Bbox坐标
+            # 根据正样本 anchor point 所在的位置以及预测出来的四条边来将折四条边还原成Bbox的坐标格式: (x1, y1, x2, y2)
+ 
+            pos_decoded_bbox_preds = self.bbox_decoder(
+                pos_points, pos_bbox_preds)
+            # 得到GT的Bbox坐标
+            pos_decoded_target_preds = self.bbox_decoder(
+                pos_points, pos_bbox_targets)
+
+            loss_bbox = giou_loss(
+                pos_decoded_bbox_preds,
+                pos_decoded_target_preds,
+                reduction="sum"
+            )/num_pos
+            #print(loss_bbox)
+            Loss_c = nn.BCEWithLogitsLoss(reduction='sum')
+            #print(pos_centerness.shape,pos_centerness_targets.shape)
+            loss_centerness= Loss_c(
+                pos_centerness,
+                pos_centerness_targets,
+            )/num_pos
+            #print(loss_centerness)
+
+        else:
+            reg_loss = pos_bbox_preds.sum()
+            loss_centerness = pos_centerness.sum()
+        #loss_cls = loss_cls.sum()
+        #print('cls',loss_cls)
+        #loss_bbox = loss_bbox.sum()
+        #print('bbox',loss_bbox)
+        final_loss = loss_cls+loss_bbox+loss_centerness
+        #final_loss=loss_cls.clone()+loss_centerness
+        #final_loss[pos_inds]=loss_cls[pos_inds]+loss_bbox
+
+        losses={
+            "cls_loss":loss_cls,
+            "reg_loss":loss_bbox,
+            "ctr_loss":loss_centerness,
+            "final_loss":final_loss
+
+        }
+
         return losses
+
+    def bbox_decoder(self,pos_points, pos_bbox_preds):
+        l=pos_bbox_preds[:,0]
+        r=pos_bbox_preds[:,2]
+        t=pos_bbox_preds[:,1]
+        b=pos_bbox_preds[:,3]
+        x=pos_points[:,0]
+        y=pos_points[:,1]
+
+        x1 = - l + x
+        x2 = r + x
+        y1 = - t + y
+        y2 = b + y
+        bbox_encoded = torch.stack((x1,y1,x2,y2),-1)
+        return bbox_encoded
+
+
+    def centerness_target(self, pos_bbox_targets):
+        left_right = pos_bbox_targets[:, [0, 2]]
+        top_bottom = pos_bbox_targets[:, [1, 3]]
+        if len(left_right) == 0:
+            centerness_targets = left_right[..., 0]
+        else:
+            centerness_targets = (
+                left_right.min(dim=-1)[0] / left_right.max(dim=-1)[0]) * (
+                    top_bottom.min(dim=-1)[0] / top_bottom.max(dim=-1)[0])
+        return torch.sqrt(centerness_targets)
+
+
+
+
+
+    def get_targets(self, points, targets, strides, reg_range):
+        num_levels = len(points)
+
+        gt_labels = []
+        gt_bboxes = []
+        for target in targets:
+            gt_labels.append(target["labels"])
+            gt_bboxes.append(target["boxes"])
+
+        #print('num',len(gt_bboxes))
+        #for i in range(4):
+            #print(gt_labels[i].shape)
+        #print(gt_bboxes[0].shape,gt_bboxes[1].shape,gt_bboxes[2].shape,gt_bboxes[3].shape)
+
+        num_images = len(gt_labels)
+
+
+        expanded_object_sizes_of_interest = []
+        for l, points_per_level in enumerate(points):
+            object_sizes_of_interest_per_level = \
+                points_per_level.new_tensor(reg_range[l])
+            expanded_object_sizes_of_interest.append(
+                object_sizes_of_interest_per_level[None].expand(len(points_per_level), -1)
+            )
+
+        concat_regress_ranges = torch.cat(expanded_object_sizes_of_interest, dim=0)
+        #make the concat_regress_ranges and concat_points the same size
+        num_points_per_level = [center.size(0) for center in points]
+
+        concat_points = torch.cat(points, dim=0)
+        #print(concat_regress_ranges.shape,concat_points.shape)
+
+        #get labels and bbox_targets of each image for all anchor points
+        labels_list = []
+        bbox_targets_list = []
+        for i in range(num_images):
+            l, b = self.get_target_single(concat_points, gt_bboxes[i],gt_labels[i], strides, concat_regress_ranges, num_points_per_level)
+            labels_list.append(l)
+            bbox_targets_list.append(b)
+        #print(labels_list[0].shape,bbox_targets_list[1].shape)
+
+        #labels_list[0][0].shape+labels_list[0][1].shape+labels_list[0][2].shape=num_points_all
+        labels_list = [labels.split(num_points_per_level, 0) for labels in labels_list]
+        bbox_targets_list = [bbox_targets.split(num_points_per_level, 0) for bbox_targets in bbox_targets_list]
+        #print(labels_list[0][0].shape,labels_list[0][1].shape)
+
+        #the concat of labels of all images of one level
+        concat_lvl_labels = []
+        concat_lvl_bbox_targets = []
+        for i in range(num_levels):
+            concat_lvl_labels.append(torch.cat([labels[i] for labels in labels_list]))
+            bbox_targets = torch.cat([bbox_targets[i] for bbox_targets in bbox_targets_list])
+            bbox_targets = bbox_targets / strides[i]
+            #divide by stride
+            concat_lvl_bbox_targets.append(bbox_targets)
+
+        #print(len(concat_lvl_bbox_targets),concat_lvl_bbox_targets[0].shape,concat_lvl_bbox_targets[1].shape,concat_lvl_bbox_targets[2].shape)
+        
+
+        return concat_lvl_labels, concat_lvl_bbox_targets
+
+    def get_target_single(self, points, gt_bboxes, gt_labels, strides, regress_ranges, num_points_per_lvl):
+        #Compute regression and classification targets for a single image.
+        num_points = points.shape[0]
+        num_gts = gt_labels.shape[0]
+        #print('11',num_points,num_gts)
+
+        areas = (gt_bboxes[:, 2] - gt_bboxes[:, 0]) * (gt_bboxes[:, 3] - gt_bboxes[:, 1])
+        areas = areas[None].repeat(num_points, 1)#shape: (num_anchor_point, num_gt)
+        #print(areas.shape)
+
+        regress_ranges = regress_ranges[:, None, :].expand(num_points, num_gts, 2)#shape:(num_anchor_point, num_gt, 2)
+        #print(regress_ranges.shape)
+
+        gt_bboxes = gt_bboxes[None].expand(num_points, num_gts, 4)#shape:(num_anchor_point, num_gt, 4) 
+        #print(gt_bboxes.shape)
+
+        xs, ys = points[:, 0], points[:, 1]
+        xs = xs[:, None].expand(num_points, num_gts)#shape: (num_anchor_point, num_gt)
+        ys = ys[:, None].expand(num_points, num_gts)#shape: (num_anchor_point, num_gt)
+        #print(xs.shape)
+
+        # shape: (num_anchor_point, num_gt) 
+        left = xs - gt_bboxes[..., 0]
+        right = gt_bboxes[..., 2] - xs
+        top = ys - gt_bboxes[..., 1]
+        bottom = gt_bboxes[..., 3] - ys
+        #print('left',left.shape)
+
+        #Center-Sampling
+        bbox_targets = torch.stack((left, top, right, bottom), -1)# shape:(num_anchor_point, num_gt, 4)
+        #print('b_t',bbox_targets.shape)
+
+        radius = self.center_sampling_radius
+        center_xs = (gt_bboxes[..., 0] + gt_bboxes[..., 2]) / 2# shape:(num_anchor_point, num_gt)
+        center_ys = (gt_bboxes[..., 1] + gt_bboxes[..., 3]) / 2
+        #print('center_xs',center_ys.shape)
+
+        center_gts = torch.zeros_like(gt_bboxes)#shape: (num_anchor_point, num_gt, 4)
+
+        #print('center_gts',center_gts.shape)
+
+        stride = center_xs.new_zeros(center_xs.shape)#shape: (num_anchor_point, num_gt)
+        #print('stride',stride.shape)
+
+        #only treat achor points within the stride*radius of gt_bbox as positive
+        lvl_begin = 0
+        for lvl_idx, num_points_lvl in enumerate(num_points_per_lvl):
+            lvl_end = lvl_begin + num_points_lvl
+            stride[lvl_begin:lvl_end] = strides[lvl_idx] * radius
+            lvl_begin = lvl_end
+
+        x_mins = center_xs - stride
+        y_mins = center_ys - stride
+        x_maxs = center_xs + stride
+        y_maxs = center_ys + stride
+        center_gts[..., 0] = torch.where(x_mins > gt_bboxes[..., 0], x_mins, gt_bboxes[..., 0])
+        center_gts[..., 1] = torch.where(y_mins > gt_bboxes[..., 1],y_mins, gt_bboxes[..., 1])
+        center_gts[..., 2] = torch.where(x_maxs > gt_bboxes[..., 2],gt_bboxes[..., 2], x_maxs)
+        center_gts[..., 3] = torch.where(y_maxs > gt_bboxes[..., 3],gt_bboxes[..., 3], y_maxs)
+        #shape:(num_anchor_point, num_gt, 4)
+
+
+        cb_dist_left = xs - center_gts[..., 0]
+        cb_dist_right = center_gts[..., 2] - xs
+        cb_dist_top = ys - center_gts[..., 1]
+        cb_dist_bottom = center_gts[..., 3] - ys
+        center_bbox = torch.stack((cb_dist_left, cb_dist_top, cb_dist_right, cb_dist_bottom), -1)
+        #shape:(num_anchor_point, num_gt, 4)
+
+        inside_gt_bbox_mask = center_bbox.min(-1)[0] > 0#shape: (num_anchor_point, num_gt)
+        #new l,t,b,r within the bbox; True/False
+        #print(inside_gt_bbox_mask.shape)
+
+
+        max_regress_distance = bbox_targets.max(-1)[0]#shape: (num_anchor_point, num_gt)
+        #print(max_regress_distance.shape)
+
+        inside_regress_range = (
+            (max_regress_distance >= regress_ranges[..., 0])
+            & (max_regress_distance <= regress_ranges[..., 1]))
+        #maximum of ltbr within the regress_range
+        #print(inside_regress_range.shape)
+
+        #set the unpaired area as INF, then if one anchor point has 
+        #several paired area, select the bbox with min-area
+        areas[inside_gt_bbox_mask == 0] = INF
+        areas[inside_regress_range == 0] = INF
+
+        min_area, min_area_inds = areas.min(dim=1)
+        #areas: num_gt kinds of elements
+        #print(min_area.shape,min_area[min_area != INF])
+        #print("min_area_inds",min_area_inds.shape)
+        #print("range(num_points)",range(num_points))
+        #print(gt_labels)
+        labels=gt_labels[min_area_inds]
+        labels[min_area == INF] = self.num_classes
+        #print(labels.shape)
+
+        #get bbox_targets of anchor points in an image, divide stride respectively
+        #stride = stride[:, :, None].expand(num_points, num_gts, 4)
+        #print(bbox_targets.shape,stride.shape)
+        #bbox_targets = bbox_targets/stride
+        bbox_targets = bbox_targets[range(num_points), min_area_inds]
+        #print("bbox_targets_ind",bbox_targets)
+        #print(bbox_targets.shape)
+
+
+
+        return labels, bbox_targets
+
 
     """
     Fill in the missing code here. The inference is also a bit involved. It is
