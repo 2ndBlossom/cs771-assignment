@@ -560,7 +560,6 @@ class FCOS(nn.Module):
         bbox_encoded = torch.stack((x1,y1,x2,y2),-1)
         return bbox_encoded
 
-
     def centerness_target(self, pos_bbox_targets):
         left_right = pos_bbox_targets[:, [0, 2]]
         top_bottom = pos_bbox_targets[:, [1, 3]]
@@ -571,10 +570,6 @@ class FCOS(nn.Module):
                 left_right.min(dim=-1)[0] / left_right.max(dim=-1)[0]) * (
                     top_bottom.min(dim=-1)[0] / top_bottom.max(dim=-1)[0])
         return torch.sqrt(centerness_targets)
-
-
-
-
 
     def get_targets(self, points, targets, strides, reg_range):
         num_levels = len(points)
@@ -744,7 +739,6 @@ class FCOS(nn.Module):
         #print(bbox_targets.shape)
 
 
-
         return labels, bbox_targets
 
 
@@ -784,4 +778,61 @@ class FCOS(nn.Module):
     def inference(
         self, points, strides, cls_logits, reg_outputs, ctr_logits, image_shapes
     ):
-        return detections
+        with torch.no_grad():
+            sampled_boxes = []
+            print(len(points), len(cls_logits), len(reg_outputs), len(ctr_logits),len(strides),len(image_shapes))
+        # 依次处理各个特征层的预测结果
+            for _, (l, o, b, c, s) in enumerate(zip(points, cls_logits, reg_outputs, ctr_logits, strides)):
+            # forward_for_single_feature_map()返回的是一个list，代表各图在单个特征层的预测结果(类别、得分、bbox位置)
+                sampled_boxes.append(
+                self.forward_for_single_feature_map(
+                    l, o, b, c, image_shapes, s
+                )
+            )
+
+        #detections = []
+            print(len(image_shapes),image_shapes)
+            print(cls_logits[0].shape)
+            print(len(points))
+            return detections
+
+ 
+    def forward_for_single_feature_map(
+            self, locations, box_cls,
+            box_regression, centerness,
+            image_sizes ,stride
+    ):
+        #locations:([H,W,2]),box_cls:([N,num_class,H,W]),box_regression:([N,4,H,W])
+        #centerness:([N,1,H,W]),len(image_sizes)=4,2  ,stride
+        print(locations.shape,box_cls.shape,box_regression.shape,centerness.shape,len(image_sizes),stride)
+        
+        N, C, H, W = box_cls.shape
+
+        locations = locations.view(-1,2)
+        print(locations.shape)
+        # (N,H,W,C)
+        box_cls = box_cls.view(N, C, H, W).permute(0, 2, 3, 1)
+        print(box_cls.shape)
+        # (N,H*W,C) 将logits经过sigmoid函数做多个二分类
+        box_cls = box_cls.reshape(N, -1, C).sigmoid()
+        print(box_cls.shape)
+
+        # (N,H,W,4)
+        box_regression = box_regression.view(N, 4, H, W).permute(0, 2, 3, 1)
+        # (N,H*W,4)
+        box_regression = box_regression.reshape(N, -1, 4)
+
+        # (N,H,W,1)
+        centerness = centerness.view(N, 1, H, W).permute(0, 2, 3, 1)
+        # (N,H*W)
+        centerness = centerness.reshape(N, -1).sigmoid()
+
+
+
+        # (N,H*W,C) bool True or False
+        candidate_inds = box_cls > self.score_thresh
+        
+
+
+        return results
+
